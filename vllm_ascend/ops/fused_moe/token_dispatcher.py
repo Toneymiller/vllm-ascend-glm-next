@@ -227,11 +227,22 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
-        output = (
-            torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
-            if self.enable_dispatch_v2
-            else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
-        )
+        try:
+            output = (
+                torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
+                if self.enable_dispatch_v2
+                else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
+            )
+        except Exception:
+            import logging
+            _dbg = {
+                k: (tuple(v.shape), str(v.dtype)) if hasattr(v, "shape") else v
+                for k, v in kwargs_mc2.items()
+            }
+            logging.getLogger("vllm.mc2_debug").error(
+                "MC2 dispatch failed, kwargs=%s", _dbg
+            )
+            raise
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
             expand_x,

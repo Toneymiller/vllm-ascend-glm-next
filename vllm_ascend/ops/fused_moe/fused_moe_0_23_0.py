@@ -258,7 +258,9 @@ class AscendFusedMoE(FusedMoE):
         self.moe_config.num_experts = self.global_num_experts
         self.moe_config.num_local_experts = self.local_num_experts
         self.moe_config.global_redundant_expert_num = self.global_redundant_expert_num
-        self.swiglu_limit = getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 0)
+        # `or 0.0`: an explicit `swiglu_limit: null` in config.json means
+        # "no clamp" (HF convention), same as the eager path's `> 0` check.
+        self.swiglu_limit = getattr(self.vllm_config.model_config.hf_config, "swiglu_limit", 0) or 0.0
 
         moe_quant_params = {
             "num_experts": self.local_num_experts,

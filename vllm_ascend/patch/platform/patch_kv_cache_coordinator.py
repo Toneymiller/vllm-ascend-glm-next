@@ -190,7 +190,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             else:
                 attention_groups.append((spec, [i], manager_cls))
 
-        assert len(attention_groups) > 1, "HybridKVCacheCoordinator requires at least two attention groups."
+        assert len(attention_groups) >= 1, "HybridKVCacheCoordinator requires at least one attention group."
 
         # Put full attention first: its efficient left-to-right scan provides
         # a tighter initial bound, reducing work for subsequent groups.
@@ -481,6 +481,24 @@ def get_kv_cache_coordinator(
             metrics_collector=metrics_collector,
             max_num_batched_tokens=max_num_batched_tokens,
             scheduler_block_size=scheduler_block_size,
+        )
+
+    if len(kv_cache_config.kv_cache_groups) == 0:
+        # No KV cache groups (e.g., all-linear-attention models or models without
+        # registered KV cache specs): force disable prefix caching to use the
+        # no-prefix-cache coordinator which does not require attention groups.
+        return _orig_get_kv_cache_coordinator(
+            kv_cache_config=kv_cache_config,
+            max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
+            use_eagle=use_eagle,
+            enable_caching=False,
+            enable_kv_cache_events=enable_kv_cache_events,
+            dcp_world_size=dcp_world_size,
+            pcp_world_size=pcp_world_size,
+            hash_block_size=hash_block_size,
+            scheduler_block_size=scheduler_block_size,
+            metrics_collector=metrics_collector,
         )
 
     if len(kv_cache_config.kv_cache_groups) == 1 or not enable_caching:
