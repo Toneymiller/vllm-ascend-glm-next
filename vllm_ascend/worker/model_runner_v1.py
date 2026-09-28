@@ -347,6 +347,56 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+def _zero_static_kv_buffers(runner) -> None:
+    """Zero every KV-cache / recurrent-state tensor in static_forward_context.
+
+    Fix for the GLM-5.3-Flash C8 accuracy collapse: FULL_DECODE_ONLY capture
+    runs dummy decodes over the persistent buffers while the C8 cache is
+    still all-zero; NaNs produced by the dummy forward (e.g. 0/0 in the
+    dynamic-quant read-back path of the SFA fp8 KV write) get baked into the
+    resident KDA recurrent state and SFA fp8 KV pages, and nothing resets the
+    buffers after capture. The first real request then reads poisoned state
+    and collapses into emitting '!' forever. Zeroing right after
+    capture_model() restores the logically-empty state the engine assumes at
+    startup. This runs once per startup and costs well under a second.
+    """
+    try:
+        ctx = runner.compilation_config.static_forward_context or {}
+    except Exception as e:  # pragma: no cover - defensive only
+        logger.warning("===== [STATE-ZERO] no static_forward_context: %s =====", e)
+        return
+
+    n_tensors = 0
+    n_bytes = 0
+
+    def _walk(obj):
+        nonlocal n_tensors, n_bytes
+        if isinstance(obj, torch.Tensor):
+            if obj.numel():
+                try:
+                    obj.zero_()
+                except RuntimeError:
+                    # fp8 storages may not implement zero_(); reinterpret.
+                    obj.view(torch.int8).zero_()
+                n_tensors += 1
+                n_bytes += obj.numel() * obj.element_size()
+            return
+        if isinstance(obj, (list, tuple)):
+            for o in obj:
+                _walk(o)
+        elif isinstance(obj, dict):
+            for o in obj.values():
+                _walk(o)
+
+    for _lname, mod in ctx.items():
+        _walk(getattr(mod, "kv_cache", None))
+    logger.info(
+        "Zeroed %d static KV-cache / recurrent-state tensors (%.2f GiB) after cudagraph capture.",
+        n_tensors,
+        n_bytes / (1 << 30),
+    )
+
+
 class NPUModelRunner(GPUModelRunner):
     # vLLM #51718 describes compatible KV cache groups as views over one
     # standardized backing allocation. The default runner preserves that
@@ -6305,6 +6355,8 @@ class NPUModelRunner(GPUModelRunner):
                 cuda_graph_size = GPUModelRunner.capture_model(self)
         finally:
             self._engram_capture_active = False
+
+        _zero_static_kv_buffers(self)
 
         mgr = self.encoder_cudagraph_manager
         if mgr is not None and self.update_stream is not None:
