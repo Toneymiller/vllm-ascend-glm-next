@@ -373,41 +373,59 @@ def _iter_kv_tensors(kv_cache: Any) -> Iterator[torch.Tensor]:
             yield from _iter_kv_tensors(item)
 
 
-def _zero_tensor(t: torch.Tensor) -> None:
-    """Zero a tensor in place without allocating a same-size buffer.
+# fp8 storages may not implement zero_(); they are zeroed through an int8
+# reinterpretation (or a scalar broadcast when not contiguous) instead.
+_FP8_DTYPES = frozenset(
+    getattr(torch, name)
+    for name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnuz")
+    if hasattr(torch, name)
+)
 
-    fp8 storages may not implement zero_(), and view(dtype) requires the
-    last dimension to be contiguous. The fallback must never materialize a
-    zeros_like() copy: doubling a resident buffer OOMed a nearly-full card
-    in CI (a2 mamba SSM state, 6.13 GiB with only 4.32 GiB free).
+
+# Upper bound for one chunked fill of a non-contiguous buffer, so the
+# kernel-side temporary stays small even on a nearly-full card.
+_ZERO_CHUNK_BYTES = 64 * 1024 * 1024
+
+
+def _zero_without_temp_buffer(t: torch.Tensor) -> None:
+    """Zero a tensor in place without allocating a same-size temporary.
+
+    Contiguous tensors are filled through an int8 reinterpretation of the
+    same bytes, which needs no workspace. Non-contiguous ones make even
+    zero_()/copy_() materialize a temporary proportional to the operand
+    size on NPU (a2 CI OOMed with 6-12 GiB extra on a nearly-full card),
+    so they are filled with a scalar broadcast in dim-0 chunks bounded by
+    _ZERO_CHUNK_BYTES.
     """
-    try:
-        t.zero_()
-        return
-    except RuntimeError:
-        pass
-    try:
-        # fp8 storages may not implement zero_(); reinterpret as int8.
+    if t.is_contiguous():
         t.view(torch.int8).zero_()
         return
-    except RuntimeError:
-        pass
-    logger.warning(
-        "zeroing kv buffer of shape=%s dtype=%s device=%s via scalar "
-        "broadcast because zero_() and view(int8) both failed",
-        tuple(t.shape), t.dtype, t.device)
-    try:
-        # Broadcast a scalar zero instead of allocating a zeros_like() copy.
+    if t.dim() == 0 or t.numel() * t.element_size() <= _ZERO_CHUNK_BYTES:
         t.copy_(torch.zeros((), dtype=t.dtype, device=t.device))
         return
-    except RuntimeError:
-        pass
-    if t.dim() == 0:
-        raise RuntimeError(f"cannot zero kv buffer of dtype {t.dtype} on {t.device}")
-    # Last resort: recurse over dim-0 slices, which may accept the fast
-    # paths above even when the whole tensor does not.
-    for i in range(t.shape[0]):
-        _zero_tensor(t[i])
+    rows_per_chunk = max(1, _ZERO_CHUNK_BYTES // (t[0].numel() * t.element_size()))
+    zero = torch.zeros((), dtype=t.dtype, device=t.device)
+    for start in range(0, t.shape[0], rows_per_chunk):
+        t[start:start + rows_per_chunk].copy_(zero)
+
+
+def _zero_tensor(t: torch.Tensor) -> None:
+    """Zero a tensor in place.
+
+    fp8 storages may not implement zero_() at all, and plain zero_() can
+    itself materialize a same-size temporary for some NPU dtypes/layouts
+    (a2 CI runners: 6-12 GiB extra while the pool is nearly full). Both
+    cases take the no-temporary path. Only OutOfMemoryError is treated as
+    recoverable; any other failure must abort startup loudly rather than
+    leave a poisoned buffer behind.
+    """
+    if t.dtype in _FP8_DTYPES:
+        _zero_without_temp_buffer(t)
+        return
+    try:
+        t.zero_()
+    except torch.OutOfMemoryError:
+        _zero_without_temp_buffer(t)
 
 
 def _zero_static_kv_buffers(runner) -> None:
@@ -6506,6 +6524,11 @@ class NPUModelRunner(GPUModelRunner):
         finally:
             self._engram_capture_active = False
 
+        # Capture runs dummy forwards that can leave garbage in the static
+        # KV/state buffers (e.g. GLM-5.3-Flash: KDA dummy state lands in the
+        # aliased SFA fp8 pool and reads back as NaN). Zero them once here so
+        # real requests start from the logically-empty state the engine
+        # assumes. See _zero_static_kv_buffers for the full story.
         _zero_static_kv_buffers(self)
 
         mgr = self.encoder_cudagraph_manager
