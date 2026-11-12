@@ -1,0 +1,7 @@
+pr: 21662
+entries:
+  - category: performance
+    text: >-
+      PCP prefill reuses ND communication copies of static O-projection weights
+      and computes token-local MoE routes before the PCP all-gather for supported
+      AllGather paths, including combined DP and PCP configurations.
